@@ -209,8 +209,10 @@ class ContextInjector:
 
             if not results:
                 logger.info(
-                    "No memories retrieved for agent=%s",
+                    "No memories retrieved for agent=%s "
+                    "(resolved_user_id=%s)",
                     agent_name,
+                    derived_user_id,
                 )
                 diagnostics["prompt_tokens_after"] = (
                     diagnostics["prompt_tokens_before"]
@@ -228,6 +230,16 @@ class ContextInjector:
             # candidate_count = merged set before filtering
             diagnostics["candidate_count"] = len(results)
 
+            logger.info(
+                "Injection pipeline for agent=%s: "
+                "resolved_user_id=%s, own=%d, "
+                "candidates=%d",
+                agent_name,
+                derived_user_id,
+                len(own_results),
+                len(results),
+            )
+
             # Filter by relevance threshold
             filtered = []
             for mem in results:
@@ -244,6 +256,16 @@ class ContextInjector:
                         self.relevance_threshold,
                         (mem.get("content", ""))[:60],
                     )
+
+            logger.info(
+                "Injection filtering for agent=%s: "
+                "after_relevance=%d (threshold=%.2f), "
+                "max_memories=%d",
+                agent_name,
+                len(filtered),
+                self.relevance_threshold,
+                self.max_memories,
+            )
 
             if not filtered:
                 logger.info(
@@ -377,13 +399,25 @@ class ContextInjector:
         """Issue a second retrieval for shared memories from
         other agents that belong to *user_id*.
 
+        Requests extra candidates from the provider because
+        the native search ``top_k`` is applied *before* the
+        ``_apply_sharing_filter`` post-filter.  Without the
+        over-fetch, private conversation memories can fill
+        the top-k slots and push shared profile/task memories
+        out of the result set entirely.
+
         Returns an empty list on any failure so the caller can
         fall back to using only the agent's own memories.
         """
+        # Over-fetch factor: request 4× the desired count so
+        # that post-filtering by sharing_policy still yields
+        # enough shared memories even when private conversation
+        # memories dominate the relevance ranking.
+        fetch_k = self.max_memories * 4
         try:
             params: dict = {
                 "content": user_text,
-                "k": self.max_memories,
+                "k": fetch_k,
                 "user_id": user_id,
                 "sharing_policy": "shared",
             }
