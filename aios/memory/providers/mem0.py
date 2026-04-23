@@ -11,7 +11,11 @@ from typing import Dict, Any, List, TYPE_CHECKING
 
 from cerebrum.memory.apis import MemoryQuery, MemoryResponse
 
-from .base import MemoryProvider
+from .base import (
+    MemoryProvider,
+    _apply_sharing_filter,
+    _enrich_metadata,
+)
 
 if TYPE_CHECKING:
     from aios.memory.note import MemoryNote
@@ -260,6 +264,20 @@ class Mem0Provider(MemoryProvider):
                 "timestamp": memory_note.timestamp,
                 "memory_note_id": memory_note.id
             }
+
+            # Preserve cross-agent metadata fields so
+            # that _apply_sharing_filter can read them
+            # on retrieval.
+            if hasattr(memory_note, 'metadata') and memory_note.metadata:
+                for key in (
+                    "owner_agent",
+                    "sharing_policy",
+                    "memory_type",
+                    "user_id",
+                ):
+                    val = memory_note.metadata.get(key)
+                    if val is not None:
+                        metadata[key] = val
             
             # Build add parameters
             add_kwargs = {
@@ -387,84 +405,145 @@ class Mem0Provider(MemoryProvider):
     def retrieve_memory(self, query: MemoryQuery) -> MemoryResponse:
         """Search for memories in Mem0 matching the query.
         
-        Performs semantic search using Mem0's search functionality to find
-        memories similar to the query content.
+        Performs semantic search using Mem0's search functionality to
+        find memories similar to the query content.  Results are
+        filtered by cross-agent sharing rules when ``agent_name``,
+        ``user_id``, or ``sharing_policy`` are present in
+        ``query.params``.
         
         Args:
             query: MemoryQuery containing:
                   - params["content"]: The search query text
                   - params["k"]: Maximum number of results to return
-                  - params["user_id"]: Optional user ID for scoped search
-                  - params["agent_id"]: Optional agent ID for scoped search
+                  - params["agent_name"]: (optional) requesting agent
+                  - params["user_id"]: (optional) user-scope filter
+                  - params["sharing_policy"]: (optional) policy filter
+                  - params["agent_id"]: Optional agent ID for search
         
         Returns:
-            MemoryResponse with success=True and search_results on success.
+            MemoryResponse with success=True and search_results on
+            success.
         """
         try:
             content = query.params.get("content", "")
             k = query.params.get("k", 5)
-            user_id = query.params.get("user_id", self.default_user_id)
-            agent_id = query.params.get("agent_id", self.default_agent_id)
+            agent_name = query.params.get("agent_name")
+            sharing_policy = query.params.get(
+                "sharing_policy"
+            )
+
+            # Use user_id from params when provided;
+            # fall back to the configured default otherwise.
+            user_id = query.params.get("user_id")
+            search_user_id = (
+                user_id
+                if user_id is not None
+                else self.default_user_id
+            )
+
+            agent_id = query.params.get(
+                "agent_id", self.default_agent_id
+            )
             
-            # Build search parameters
-            search_kwargs = {
-                "user_id": user_id,
-                "limit": k
+            # Build search parameters.
+            # Mem0 >= 0.1.29 requires entity IDs inside
+            # a ``filters`` dict rather than as top-level
+            # keyword arguments.
+            search_filters: dict = {
+                "user_id": search_user_id,
+            }
+            search_kwargs: dict = {
+                "filters": search_filters,
+                "top_k": k,
             }
             
             if agent_id:
-                search_kwargs["agent_id"] = agent_id
+                search_filters["agent_id"] = agent_id
             
             # Search Mem0
-            results = self.client.search(content, **search_kwargs)
+            results = self.client.search(
+                content, **search_kwargs
+            )
             
-            # Map Mem0 results to standard format
-            search_results = []
-            
-            # Handle different result formats from Mem0
+            # Normalise Mem0 results into a flat list of
+            # dicts regardless of the response format.
+            items: list = []
             if isinstance(results, list):
-                for item in results[:k]:
-                    if isinstance(item, dict):
-                        metadata = item.get("metadata", {})
-                        search_results.append({
-                            "content": item.get("memory", ""),
-                            "keywords": metadata.get("keywords", []),
-                            "tags": metadata.get("tags", []),
-                            "category": metadata.get("category", "Uncategorized"),
-                            "timestamp": metadata.get("timestamp", ""),
-                            "score": item.get("score")
-                        })
-            elif isinstance(results, dict) and "results" in results:
-                for item in results["results"][:k]:
-                    if isinstance(item, dict):
-                        metadata = item.get("metadata", {})
-                        search_results.append({
-                            "content": item.get("memory", ""),
-                            "keywords": metadata.get("keywords", []),
-                            "tags": metadata.get("tags", []),
-                            "category": metadata.get("category", "Uncategorized"),
-                            "timestamp": metadata.get("timestamp", ""),
-                            "score": item.get("score")
-                        })
+                items = results
+            elif (
+                isinstance(results, dict)
+                and "results" in results
+            ):
+                items = results["results"]
+
+            # Apply cross-agent sharing filter when
+            # agent_name is available (injected by
+            # MemoryManager).
+            if agent_name is not None:
+                items = _apply_sharing_filter(
+                    items,
+                    agent_name,
+                    user_id,
+                    sharing_policy,
+                    lambda item: item.get("metadata", {}),
+                )
+
+            # Map filtered items to standard format,
+            # respecting k on the filtered set.
+            search_results = []
+            for item in items[:k]:
+                if not isinstance(item, dict):
+                    continue
+                metadata = _enrich_metadata(
+                    dict(item.get("metadata", {}))
+                )
+                search_results.append({
+                    "content": item.get("memory", ""),
+                    "keywords": metadata.get(
+                        "keywords", []
+                    ),
+                    "tags": metadata.get("tags", []),
+                    "category": metadata.get(
+                        "category", "Uncategorized"
+                    ),
+                    "timestamp": metadata.get(
+                        "timestamp", ""
+                    ),
+                    "score": item.get("score"),
+                    "metadata": metadata,
+                })
             
-            return MemoryResponse(success=True, search_results=search_results)
+            return MemoryResponse(
+                success=True,
+                search_results=search_results,
+            )
             
         except Exception as e:
             return MemoryResponse(
                 success=False,
-                error=f"Mem0 retrieve_memory failed: {str(e)}"
+                error=(
+                    f"Mem0 retrieve_memory failed: "
+                    f"{str(e)}"
+                ),
             )
     
     def retrieve_memory_raw(self, query: MemoryQuery) -> List['MemoryNote']:
         """Retrieve raw memory objects from Mem0 for internal processing.
         
         Similar to retrieve_memory but returns raw MemoryNote objects
-        instead of a formatted MemoryResponse.
+        instead of a formatted MemoryResponse.  Results are filtered
+        by cross-agent sharing rules when ``agent_name``,
+        ``user_id``, or ``sharing_policy`` are present in
+        ``query.params``.
         
         Args:
             query: MemoryQuery containing:
                   - params["content"]: The search query text
                   - params["k"]: Maximum number of results (default: 5)
+                  - params["agent_name"]: (optional) requesting agent
+                  - params["user_id"]: (optional) user-scope filter
+                  - params["sharing_policy"]: (optional) policy filter
+                  - params["agent_id"]: Optional agent ID for search
         
         Returns:
             List of MemoryNote objects matching the query.
@@ -473,46 +552,91 @@ class Mem0Provider(MemoryProvider):
         
         content = query.params.get("content", "")
         k = query.params.get("k", 5)
-        user_id = query.params.get("user_id", self.default_user_id)
-        agent_id = query.params.get("agent_id", self.default_agent_id)
+        agent_name = query.params.get("agent_name")
+        sharing_policy = query.params.get("sharing_policy")
+
+        # Use user_id from params when provided;
+        # fall back to the configured default otherwise.
+        user_id = query.params.get("user_id")
+        search_user_id = (
+            user_id
+            if user_id is not None
+            else self.default_user_id
+        )
+
+        agent_id = query.params.get(
+            "agent_id", self.default_agent_id
+        )
         
-        # Build search parameters
-        search_kwargs = {
-            "user_id": user_id,
-            "limit": k
+        # Build search parameters.
+        # Mem0 >= 0.1.29 requires entity IDs inside
+        # a ``filters`` dict.
+        search_filters: dict = {
+            "user_id": search_user_id,
+        }
+        search_kwargs: dict = {
+            "filters": search_filters,
+            "top_k": k,
         }
         
         if agent_id:
-            search_kwargs["agent_id"] = agent_id
+            search_filters["agent_id"] = agent_id
         
         try:
-            results = self.client.search(content, **search_kwargs)
+            results = self.client.search(
+                content, **search_kwargs
+            )
         except Exception:
             return []
         
-        # Convert Mem0 results to MemoryNote objects
-        memory_notes = []
-        
-        # Handle different result formats from Mem0
-        items = []
+        # Normalise Mem0 results into a flat list of
+        # dicts regardless of the response format.
+        items: list = []
         if isinstance(results, list):
             items = results
-        elif isinstance(results, dict) and "results" in results:
+        elif (
+            isinstance(results, dict)
+            and "results" in results
+        ):
             items = results["results"]
-        
+
+        # Apply cross-agent sharing filter when
+        # agent_name is available (injected by
+        # MemoryManager).
+        if agent_name is not None:
+            items = _apply_sharing_filter(
+                items,
+                agent_name,
+                user_id,
+                sharing_policy,
+                lambda item: item.get("metadata", {}),
+            )
+
+        # Convert filtered items to MemoryNote objects,
+        # respecting k on the filtered set.
+        memory_notes = []
         for item in items[:k]:
-            if isinstance(item, dict):
-                metadata = item.get("metadata", {})
-                memory_note = MemoryNote(
-                    content=item.get("memory", ""),
-                    id=item.get("id") or metadata.get("memory_note_id"),
-                    keywords=metadata.get("keywords", []),
-                    tags=metadata.get("tags", []),
-                    category=metadata.get("category", "Uncategorized"),
-                    context=metadata.get("context", "General"),
-                    timestamp=metadata.get("timestamp")
-                )
-                memory_notes.append(memory_note)
+            if not isinstance(item, dict):
+                continue
+            metadata = _enrich_metadata(
+                dict(item.get("metadata", {}))
+            )
+            memory_note = MemoryNote(
+                content=item.get("memory", ""),
+                id=(
+                    item.get("id")
+                    or metadata.get("memory_note_id")
+                ),
+                keywords=metadata.get("keywords", []),
+                tags=metadata.get("tags", []),
+                category=metadata.get(
+                    "category", "Uncategorized"
+                ),
+                context=metadata.get("context", "General"),
+                timestamp=metadata.get("timestamp"),
+                metadata=metadata,
+            )
+            memory_notes.append(memory_note)
         
         return memory_notes
     

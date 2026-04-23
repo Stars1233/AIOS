@@ -10,7 +10,7 @@ import os
 
 from cerebrum.memory.apis import MemoryQuery, MemoryResponse
 
-from .base import MemoryProvider
+from .base import MemoryProvider, _apply_sharing_filter, _enrich_metadata
 from aios.memory.retrievers import ChromaRetriever, QdrantRetriever
 
 if TYPE_CHECKING:
@@ -88,6 +88,16 @@ class InHouseProvider(MemoryProvider):
                 "category": memory_note.category,
                 "timestamp": memory_note.timestamp
             }
+            # Preserve cross-agent metadata fields for
+            # filtering during retrieval
+            for key in (
+                "owner_agent",
+                "user_id",
+                "sharing_policy",
+                "memory_type",
+            ):
+                if key in memory_note.metadata:
+                    metadata[key] = memory_note.metadata[key]
             self.retriever.add_document(
                 document=memory_note.content, 
                 metadata=metadata, 
@@ -229,12 +239,18 @@ class InHouseProvider(MemoryProvider):
         """Search for memories matching the query.
         
         Performs semantic search using the vector database to find
-        memories similar to the query content.
+        memories similar to the query content.  Results are filtered
+        by cross-agent sharing rules when ``agent_name``,
+        ``user_id``, or ``sharing_policy`` are present in
+        ``query.params``.
         
         Args:
             query: MemoryQuery containing:
                   - params["content"]: The search query text
                   - params["k"]: Maximum number of results to return
+                  - params["agent_name"]: (optional) requesting agent
+                  - params["user_id"]: (optional) user-scope filter
+                  - params["sharing_policy"]: (optional) policy filter
         
         Returns:
             MemoryResponse with success=True and search_results on success.
@@ -242,6 +258,9 @@ class InHouseProvider(MemoryProvider):
         try:
             content = query.params["content"]
             k = query.params.get("k", 5)
+            agent_name = query.params.get("agent_name")
+            user_id = query.params.get("user_id")
+            sharing_policy = query.params.get("sharing_policy")
             
             retrieved_results = self.retriever.search(content, k)
             retrieved_memories = []
@@ -261,18 +280,35 @@ class InHouseProvider(MemoryProvider):
                     if memory:
                         retrieved_memories.append(memory)
             
-            # Format results
+            # Apply cross-agent sharing filter when agent_name
+            # is available (injected by MemoryManager)
+            if agent_name is not None:
+                retrieved_memories = _apply_sharing_filter(
+                    retrieved_memories,
+                    agent_name,
+                    user_id,
+                    sharing_policy,
+                    lambda note: note.metadata,
+                )
+            
+            # Format results, respecting k on filtered set
             search_results = []
             for memory in retrieved_memories[:k]:
+                meta = _enrich_metadata(
+                    dict(memory.metadata)
+                )
                 search_results.append({
                     'content': memory.content,
                     'keywords': memory.keywords,
                     'tags': memory.tags,
                     'category': memory.category,
-                    'timestamp': memory.timestamp
+                    'timestamp': memory.timestamp,
+                    'metadata': meta,
                 })
             
-            return MemoryResponse(success=True, search_results=search_results)
+            return MemoryResponse(
+                success=True, search_results=search_results
+            )
         except Exception as e:
             return MemoryResponse(
                 success=False, 
@@ -283,18 +319,27 @@ class InHouseProvider(MemoryProvider):
         """Retrieve raw memory objects for internal processing.
         
         Similar to retrieve_memory but returns raw MemoryNote objects
-        instead of a formatted MemoryResponse.
+        instead of a formatted MemoryResponse.  Results are filtered
+        by cross-agent sharing rules when ``agent_name``,
+        ``user_id``, or ``sharing_policy`` are present in
+        ``query.params``.
         
         Args:
             query: MemoryQuery containing:
                   - params["content"]: The search query text
                   - params["k"]: Maximum number of results (default: 5)
+                  - params["agent_name"]: (optional) requesting agent
+                  - params["user_id"]: (optional) user-scope filter
+                  - params["sharing_policy"]: (optional) policy filter
         
         Returns:
             List of MemoryNote objects matching the query.
         """
         content = query.params["content"]
         k = query.params.get("k", 5)
+        agent_name = query.params.get("agent_name")
+        user_id = query.params.get("user_id")
+        sharing_policy = query.params.get("sharing_policy")
         
         search_results = self.retriever.search(content, k)
         retrieved_memories = []
@@ -312,6 +357,21 @@ class InHouseProvider(MemoryProvider):
                 memory = self.memories.get(doc_id)
                 if memory:
                     retrieved_memories.append(memory)
+        
+        # Apply cross-agent sharing filter when agent_name
+        # is available (injected by MemoryManager)
+        if agent_name is not None:
+            retrieved_memories = _apply_sharing_filter(
+                retrieved_memories,
+                agent_name,
+                user_id,
+                sharing_policy,
+                lambda note: note.metadata,
+            )
+        
+        # Enrich metadata on each MemoryNote and respect k
+        for memory in retrieved_memories[:k]:
+            _enrich_metadata(memory.metadata)
         
         return retrieved_memories[:k]
     

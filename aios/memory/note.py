@@ -30,7 +30,8 @@ class MemoryNote:
                  context: Optional[str] = None,
                  evolution_history: Optional[List] = None,
                  category: Optional[str] = None,
-                 tags: Optional[List[str]] = None):
+                 tags: Optional[List[str]] = None,
+                 metadata: Optional[Dict[str, Any]] = None):
         """Initialize a new memory note with its associated metadata.
         
         Args:
@@ -45,6 +46,7 @@ class MemoryNote:
             evolution_history (Optional[List]): Record of how the memory has evolved
             category (Optional[str]): Classification category
             tags (Optional[List[str]]): Additional classification tags
+            metadata (Optional[Dict[str, Any]]): Arbitrary key-value pairs for cross-agent metadata (owner_agent, user_id, sharing_policy, memory_type, etc.)
         """
         # Core content and ID
         self.content = content
@@ -66,6 +68,9 @@ class MemoryNote:
         self.retrieval_count = retrieval_count or 0
         self.evolution_history = evolution_history or []
 
+        # Cross-agent metadata
+        self.metadata = metadata or {}
+
     def return_params(self) -> Dict[str, Any]:
         return {
             "content": self.content or "",
@@ -78,5 +83,6 @@ class MemoryNote:
             "context": self.context or "",
             "evolution_history": self.evolution_history or [],
             "category": self.category or "",
-            "tags": self.tags or []
+            "tags": self.tags or [],
+            "metadata": self.metadata or {}
         }

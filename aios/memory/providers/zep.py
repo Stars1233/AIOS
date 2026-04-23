@@ -15,7 +15,11 @@ from typing import Dict, Any, List, TYPE_CHECKING
 
 from cerebrum.memory.apis import MemoryQuery, MemoryResponse
 
-from .base import MemoryProvider
+from .base import (
+    MemoryProvider,
+    _apply_sharing_filter,
+    _enrich_metadata,
+)
 
 if TYPE_CHECKING:
     from aios.memory.note import MemoryNote
@@ -145,64 +149,149 @@ class ZepProvider(MemoryProvider):
             return MemoryResponse(success=False, error=f"Zep get_memory failed: {str(e)}")
 
     def retrieve_memory(self, query: MemoryQuery) -> MemoryResponse:
-        """Semantic search via graph.search (free tier compatible)."""
+        """Semantic search via graph.search (free tier compatible).
+
+        Results are filtered by cross-agent sharing rules when
+        ``agent_name``, ``user_id``, or ``sharing_policy`` are
+        present in ``query.params``.
+        """
         try:
             content = query.params.get("content", "")
             k = query.params.get("k", 5)
-            user_id = query.params.get("user_id", self.default_user_id)
+            agent_name = query.params.get("agent_name")
+            sharing_policy = query.params.get(
+                "sharing_policy"
+            )
+
+            # Use user_id from params when provided;
+            # fall back to the configured default otherwise.
+            user_id = query.params.get("user_id")
+            search_user_id = (
+                user_id
+                if user_id is not None
+                else self.default_user_id
+            )
 
             results = self.client.graph.search(
                 query=content,
-                user_id=user_id,
+                user_id=search_user_id,
                 limit=k,
                 scope="edges"
             )
 
-            search_results = []
             edges = getattr(results, 'edges', []) or []
+
+            # Apply cross-agent sharing filter when
+            # agent_name is available (injected by
+            # MemoryManager).
+            if agent_name is not None:
+                edges = _apply_sharing_filter(
+                    edges,
+                    agent_name,
+                    user_id,
+                    sharing_policy,
+                    lambda edge: (
+                        dict(getattr(edge, 'metadata', None)
+                             or {})
+                    ),
+                )
+
+            search_results = []
             for edge in edges[:k]:
                 fact = getattr(edge, 'fact', '') or ''
                 score = getattr(edge, 'score', None)
+                metadata = _enrich_metadata(
+                    dict(getattr(edge, 'metadata', None)
+                         or {})
+                )
                 search_results.append({
                     "content": fact,
                     "keywords": [],
                     "tags": [],
                     "category": "Uncategorized",
-                    "timestamp": str(getattr(edge, 'created_at', '')),
-                    "score": score
+                    "timestamp": str(
+                        getattr(edge, 'created_at', '')
+                    ),
+                    "score": score,
+                    "metadata": metadata,
                 })
 
-            return MemoryResponse(success=True, search_results=search_results)
+            return MemoryResponse(
+                success=True,
+                search_results=search_results,
+            )
 
         except Exception as e:
-            return MemoryResponse(success=False, error=f"Zep retrieve_memory failed: {str(e)}")
+            return MemoryResponse(
+                success=False,
+                error=(
+                    f"Zep retrieve_memory failed: "
+                    f"{str(e)}"
+                ),
+            )
 
     def retrieve_memory_raw(self, query: MemoryQuery) -> List['MemoryNote']:
-        """Return graph search results as MemoryNote objects."""
+        """Return graph search results as MemoryNote objects.
+
+        Results are filtered by cross-agent sharing rules when
+        ``agent_name``, ``user_id``, or ``sharing_policy`` are
+        present in ``query.params``.
+        """
         from aios.memory.note import MemoryNote
 
         content = query.params.get("content", "")
         k = query.params.get("k", 5)
-        user_id = query.params.get("user_id", self.default_user_id)
+        agent_name = query.params.get("agent_name")
+        sharing_policy = query.params.get("sharing_policy")
+
+        # Use user_id from params when provided;
+        # fall back to the configured default otherwise.
+        user_id = query.params.get("user_id")
+        search_user_id = (
+            user_id
+            if user_id is not None
+            else self.default_user_id
+        )
 
         try:
             results = self.client.graph.search(
                 query=content,
-                user_id=user_id,
+                user_id=search_user_id,
                 limit=k,
                 scope="edges"
             )
 
-            memory_notes = []
             edges = getattr(results, 'edges', []) or []
+
+            # Apply cross-agent sharing filter when
+            # agent_name is available (injected by
+            # MemoryManager).
+            if agent_name is not None:
+                edges = _apply_sharing_filter(
+                    edges,
+                    agent_name,
+                    user_id,
+                    sharing_policy,
+                    lambda edge: (
+                        dict(getattr(edge, 'metadata', None)
+                             or {})
+                    ),
+                )
+
+            memory_notes = []
             for edge in edges[:k]:
                 fact = getattr(edge, 'fact', '') or ''
                 if fact:
+                    metadata = _enrich_metadata(
+                        dict(getattr(edge, 'metadata', None)
+                             or {})
+                    )
                     memory_notes.append(MemoryNote(
                         content=fact,
                         id=getattr(edge, 'uuid_', None),
                         context="General",
-                        category="Uncategorized"
+                        category="Uncategorized",
+                        metadata=metadata,
                     ))
             return memory_notes
 

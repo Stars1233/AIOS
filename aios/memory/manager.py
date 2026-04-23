@@ -5,12 +5,15 @@ This module provides the MemoryManager class that serves as the high-level
 interface to the memory management system. It uses pluggable memory providers
 to enable different storage backends (in-house, Mem0, Zep).
 """
-from typing import Optional, Dict, Any
+import logging
+from typing import Optional, Dict, Any, Set
 
 from cerebrum.memory.apis import MemoryQuery, MemoryResponse
 
 from aios.config.config_manager import config as global_config
 from .providers import ProviderFactory, MemoryProvider
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
@@ -26,6 +29,12 @@ class MemoryManager:
     
     Attributes:
         provider (MemoryProvider): The configured memory provider instance
+        known_user_ids (Set[str]): User IDs observed in memory metadata
+            during add_memory operations.  The ContextInjector reads
+            this set to discover which real user_ids have memories in
+            the store, enabling cross-agent shared retrieval without
+            requiring the requesting agent to already have its own
+            memories.
     """
     
     def __init__(
@@ -43,6 +52,10 @@ class MemoryManager:
                      Valid values: "in-house", "mem0", "zep"
         """
         self.log_mode = log_mode
+        
+        # Registry of user_ids seen in memory metadata.
+        # Populated by add_memory; read by ContextInjector.
+        self.known_user_ids: Set[str] = set()
         
         # Get configuration
         memory_config = global_config.get_memory_config() or {}
@@ -132,6 +145,13 @@ class MemoryManager:
             filtered_data["category"] = metadata.get("category", "Uncategorized")
         
         memory_note = MemoryNote(**filtered_data)
+        
+        # Preserve the full metadata dict on the note so
+        # that providers can read cross-agent fields
+        # (user_id, owner_agent, sharing_policy, memory_type).
+        if metadata:
+            memory_note.metadata = metadata
+        
         return memory_note
     
     def address_request(self, memory_syscall) -> MemoryResponse:
@@ -163,6 +183,15 @@ class MemoryManager:
         
         if operation_type == "add_memory":
             memory_note = self._analyze_query_to_memory(query)
+            # Track user_id for cross-agent discovery.
+            uid = (memory_note.metadata or {}).get("user_id")
+            if uid and uid != query.params.get("agent_name", ""):
+                self.known_user_ids.add(uid)
+                logger.debug(
+                    "Registered user_id=%s (known: %s)",
+                    uid,
+                    self.known_user_ids,
+                )
             return self.provider.add_memory(memory_note)
         
         elif operation_type == "remove_memory":
@@ -176,9 +205,11 @@ class MemoryManager:
             return self.provider.get_memory(query.params["memory_id"])
         
         elif operation_type == "retrieve_memory":
+            query.params["agent_name"] = memory_syscall.agent_name
             return self.provider.retrieve_memory(query)
         
         elif operation_type == "retrieve_memory_raw":
+            query.params["agent_name"] = memory_syscall.agent_name
             return self.provider.retrieve_memory_raw(query)
         
         else:
